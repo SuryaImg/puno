@@ -60,6 +60,8 @@ from call_guardrails import (
     should_fire_checkin,
     mentions_audibility_question,
     reengagement_line,
+    states_booking_confirmed,
+    asks_to_repeat,
     stall_recovery_line,
     gender_drifted,
     hindi_self_gender,
@@ -470,6 +472,19 @@ def build_agent_instructions(
     if bid:
         stored.append(f"- Booking ID: {bid} (BOOKING CONFIRMED - the confirmation SMS has fired)")
 
+    # TODAY'S DATE. The model was never told what day it is, so it had no way to
+    # know a date was in the past — on the reported call it happily took a booking
+    # for 12 August when the call was on 2 September. Refreshed every turn, and
+    # placed at the TOP of the live state so it is the first thing re-read.
+    _n = _now_ist()
+    stored.insert(0, (
+        f"- TODAY is {_n.strftime('%A, %d %B %Y')} and the time now is "
+        f"{_n.strftime('%I:%M %p').lstrip('0')} IST. Never accept a booking for a date "
+        f"or time before this. If the caller names a date that has already passed, say "
+        f"so plainly and ask which upcoming date they mean. A month named without a "
+        f"year means its NEXT occurrence, not one already gone."
+    ))
+
     stored_str = "\n".join(stored) if stored else "- (nothing captured yet)"
     missing_str = "\n".join(missing) if missing else "- (nothing outstanding)"
 
@@ -819,6 +834,192 @@ def validate_and_normalize_appointment_datetime(date_str: str, time_str: str) ->
     normalized_time = appt_dt.strftime("%I:%M %p").lstrip('0')
     normalized_date = appt_dt.strftime("%Y-%m-%d")
     return normalized_date, normalized_time, None
+
+
+# ===========================================================================
+# PAST DATE/TIME GUARD — a booking must never be taken for a moment that has
+# already happened.
+#
+# Why this is separate from validate_and_normalize_appointment_datetime() above:
+# that function bails out entirely unless the date is already YYYY-MM-DD
+# (`if not date_match: return date_str, time_str, None`), so a spoken
+# "12 August 2026" or "12 अगस्त" sailed through unchecked. It also enforces
+# hospital OPD hours (9:00 AM-7:00 PM) — PUNO Jaipur runs 11:30 AM-10:00 PM —
+# so reusing it at the booking tools would have imported a second, unrelated bug.
+#
+# The other half of the problem is that update_booking_details() and
+# confirm_booking() wrote state.appointment_date straight from their argument
+# with no validation at all, and the only live validation path
+# (_apply_spoken_datetime) inspects raw ASR text, never the tool arguments.
+# ===========================================================================
+
+_MONTHS = {
+    "jan": 1, "january": 1, "जनवरी": 1,
+    "feb": 2, "february": 2, "फरवरी": 2, "फ़रवरी": 2,
+    "mar": 3, "march": 3, "मार्च": 3,
+    "apr": 4, "april": 4, "अप्रैल": 4,
+    "may": 5, "मई": 5,
+    "jun": 6, "june": 6, "जून": 6,
+    "jul": 7, "july": 7, "जुलाई": 7,
+    "aug": 8, "august": 8, "अगस्त": 8,
+    "sep": 9, "sept": 9, "september": 9, "सितंबर": 9, "सितम्बर": 9,
+    "oct": 10, "october": 10, "अक्टूबर": 10, "अक्तूबर": 10,
+    "nov": 11, "november": 11, "नवंबर": 11, "नवम्बर": 11,
+    "dec": 12, "december": 12, "दिसंबर": 12, "दिसम्बर": 12,
+}
+_MONTH_ALT = "|".join(sorted((re.escape(k) for k in _MONTHS), key=len, reverse=True))
+# Script-agnostic right boundary for a month name.  cannot be used: जनवरी and
+# फरवरी end in a combining vowel sign (U+0940) which is not a \w character, so
+# a trailing  silently fails to match and those months never parse.
+_MONTH_END = r"(?=$|[\s,.;:!?/-]|\d)"
+
+
+def _resolve_booking_date(raw: str, today: datetime.date):
+    """(date, explicit_year, ok) from a spoken or ISO date. ok=False if unparseable.
+
+    A date with NO year is resolved to its NEXT occurrence, which is what a caller
+    means: on 2 September, "12 August" is next August, not one three weeks gone.
+    Rejecting it outright would be wrong — and silently reading it as this year is
+    exactly how the reported call booked a date in the past.
+    """
+    t = (raw or "").strip().lower()
+    if not t:
+        return None, False, False
+
+    # NOTE: \b is unusable against Devanagari here. Words like परसों and the
+    # months जनवरी / फरवरी end in a combining mark (U+0902, U+0940), which is not
+    # a \w character, so a trailing \b never matches and the word silently fails
+    # to parse. Latin alternatives keep \b; Devanagari is matched by substring.
+    if re.search(r"\b(day\s+after\s+tomorrow|parso|parson)\b", t) or "परसों" in t or "परसो" in t:
+        return today + datetime.timedelta(days=2), True, True
+    if re.search(r"\btomorrow\b", t) or re.search(r"(?<![a-z])kal(?![a-z])", t) or "कल" in t:
+        return today + datetime.timedelta(days=1), True, True
+    if re.search(r"\b(today|aaj|tonight)\b", t) or "आज" in t:
+        return today, True, True
+
+    def _mk(y, m, d, explicit):
+        try:
+            return datetime.date(y, m, d), explicit, True
+        except ValueError:
+            return None, False, False
+
+    m = re.search(r"\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b", t)          # ISO
+    if m:
+        return _mk(int(m.group(1)), int(m.group(2)), int(m.group(3)), True)
+    m = re.search(r"\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})\b", t)          # D/M/Y (Indian)
+    if m:
+        return _mk(int(m.group(3)), int(m.group(2)), int(m.group(1)), True)
+
+    # "12 August 2026" / "12 अगस्त" / "August 12"
+    m = re.search(r"\b(\d{1,2})\s*(?:st|nd|rd|th)?\s+(" + _MONTH_ALT + r")" + _MONTH_END + r"\s*,?\s*(\d{4})?", t)
+    if not m:
+        m2 = re.search(r"(" + _MONTH_ALT + r")" + _MONTH_END + r"\s+(\d{1,2})\s*(?:st|nd|rd|th)?\b\s*,?\s*(\d{4})?", t)
+        if m2:
+            day, mon_s, yr = int(m2.group(2)), m2.group(1), m2.group(3)
+        else:
+            return None, False, False
+    else:
+        day, mon_s, yr = int(m.group(1)), m.group(2), m.group(3)
+
+    mon = _MONTHS.get(mon_s)
+    if not mon:
+        return None, False, False
+    if yr:
+        return _mk(int(yr), mon, day, True)
+    # No year given — roll to the next occurrence of that day/month.
+    for y in (today.year, today.year + 1):
+        try:
+            cand = datetime.date(y, mon, day)
+        except ValueError:
+            continue
+        if cand >= today:
+            return cand, False, True
+    return None, False, False
+
+
+def _resolve_booking_time(raw: str):
+    """(hour, minute) in 24h, or None if no specific clock time is present."""
+    t = (raw or "").strip().lower()
+    if not t:
+        return None
+    # Hindi day-parts that disambiguate a bare number.
+    pm_word = bool(re.search(r"\b(pm|shaam|sham|evening|raat|night|dopahar|afternoon)\b", t)
+                   or re.search(r"शाम|रात|दोपहर", t))
+    am_word = bool(re.search(r"\b(am|subah|morning)\b", t) or re.search(r"सुबह", t))
+
+    m = re.search(r"\b(\d{1,2})[:.](\d{2})\s*(am|pm)?\b", t)
+    if m:
+        hh, mm, ap = int(m.group(1)), int(m.group(2)), m.group(3)
+    else:
+        m = re.search(r"\b(\d{1,2})\s*(am|pm)\b", t)
+        if m:
+            hh, mm, ap = int(m.group(1)), 0, m.group(2)
+        else:
+            m = re.search(r"\b(\d{1,2})\b", t)
+            if not m:
+                return None
+            hh, mm, ap = int(m.group(1)), 0, None
+
+    if ap == "pm" or (ap is None and pm_word):
+        if hh < 12:
+            hh += 12
+    elif ap == "am" or (ap is None and am_word):
+        if hh == 12:
+            hh = 0
+    elif ap is None and hh <= 10:
+        # PUNO opens 11:30 AM and closes 10:00 PM, so a bare "5" can only be 5 PM.
+        hh += 12
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        return None
+    return hh, mm
+
+
+def check_booking_not_past(date_str: str, time_str: str, *, now=None):
+    """(normalized_date, normalized_time, error) — error is set if it is in the past.
+
+    Fails OPEN on anything it cannot confidently resolve: refusing a booking we
+    merely failed to parse would be a worse bug than the one being fixed. Only a
+    date/time we positively know is behind us is rejected.
+    """
+    now = now or _now_ist()
+    today = now.date()
+    d_raw, t_raw = (date_str or "").strip(), (time_str or "").strip()
+    if not d_raw:
+        return date_str, time_str, None
+
+    d, explicit_year, ok = _resolve_booking_date(d_raw, today)
+    if not ok or d is None:
+        return date_str, time_str, None          # unparseable -> do not block
+
+    if d < today:
+        when = d.strftime("%d %B %Y")
+        if explicit_year:
+            return date_str, time_str, (
+                f"PAST_DATE: {when} has already passed (today is "
+                f"{today.strftime('%d %B %Y')}). Do NOT store or confirm this. Tell the "
+                "caller — in their own language — that the date is in the past and ask "
+                "which upcoming date they want."
+            )
+        return date_str, time_str, (
+            f"PAST_DATE: {when} is in the past. Do NOT store it. Ask the caller which "
+            "upcoming date they mean."
+        )
+
+    norm_date = d.strftime("%Y-%m-%d")
+    hm = _resolve_booking_time(t_raw) if t_raw else None
+    if hm is None:
+        return norm_date, time_str, None         # no clock time to judge
+
+    hh, mm = hm
+    slot = datetime.datetime(d.year, d.month, d.day, hh, mm)
+    if (slot - now).total_seconds() < -60:       # 60s grace absorbs clock rounding
+        return date_str, time_str, (
+            f"PAST_TIME: {slot.strftime('%I:%M %p').lstrip('0')} today has already "
+            f"passed (it is now {now.strftime('%I:%M %p').lstrip('0')}). Do NOT store or "
+            "confirm this. Ask the caller — in their own language — for a later time "
+            "today or another day."
+        )
+    return norm_date, slot.strftime("%I:%M %p").lstrip("0"), None
 
 
 _RETRY_TASKS: set = set()
@@ -1772,11 +1973,26 @@ async def end_call(ctx: RunContext) -> str:
     except Exception:
         pass
 
+    # Mark the wrap-up instant. Anything the model generates AFTER the closing
+    # line is, by definition, speech the caller should never hear — on the
+    # reported call it re-stated "your booking is confirmed" a third time, after
+    # goodbye. The output guard cuts those turns off; this stamp is what tells it
+    # the goodbye has happened.
+    try:
+        ctx.userdata["_wrapup_at"] = time.monotonic()
+        ctx.userdata["_post_wrapup_turns"] = 0
+    except Exception:
+        pass
+
     asyncio.create_task(_execute_end_call_drop(ctx.userdata))
-    return (
-        "Done. The call will disconnect cleanly 1 second after you finish speaking the closing greeting. "
-        "Produce no further speech after the greeting."
-    )
+    # Deliberately terse. Every tool result provokes a fresh model turn, and the
+    # old wording ("The call will disconnect cleanly 1 second after you finish
+    # speaking the closing greeting") gave that turn something to narrate. There
+    # is nothing here to elaborate on.
+    # No language hint here on purpose: every other tool result carries one, but
+    # "speak in Hindi" alongside "say nothing" is a contradiction that invites the
+    # very turn this is trying to suppress.
+    return "Call ending. Say nothing further."
 
 
 # ===========================================================================
@@ -2085,6 +2301,26 @@ async def update_booking_details(
         state.kids_under7 = int(kids_under7)
     if adults_7plus >= 0:
         state.adults_7plus = int(adults_7plus)
+    # PAST DATE/TIME GUARD. This is the choke point: the model passes whatever it
+    # heard straight into this argument, and it used to be written to state with no
+    # check at all. Refuse to STORE a slot that has already happened, so a past
+    # date can never reach confirm_booking in the first place.
+    if date.strip() or slot.strip():
+        _nd, _nt, _derr = check_booking_not_past(
+            date.strip() or (state.appointment_date or ""),
+            slot.strip() or (state.appointment_time or ""),
+        )
+        if _derr:
+            logger.warning(
+                "[PastDate] Refused to store date=%r slot=%r — %s",
+                date.strip(), slot.strip(), _derr.split(":")[0],
+            )
+            return _derr + _caller_language_reply_hint(state)
+        if date.strip():
+            date = _nd
+        if slot.strip() and _nt:
+            slot = _nt
+
     if date.strip():
         state.appointment_date = date.strip()
     if slot.strip():
@@ -2142,9 +2378,15 @@ async def confirm_booking(
 
     # Idempotency: already booked on this call → return the same booking_id.
     if state.booking_id:
+        # "Reassure the caller their booking stands" used to live here, which is
+        # an instruction to state the confirmation AGAIN — the third repetition
+        # on the reported call. The caller has already been told; saying it once
+        # more is the bug, not reassurance.
         return (
-            f"Already confirmed (booking id {state.booking_id}). Do not book again. Reassure the caller "
-            "their booking stands and ask if there's anything else." + _caller_language_reply_hint(state)
+            f"Already confirmed (booking id {state.booking_id}). Do not book again, and do NOT "
+            "state that the booking is confirmed again — the caller has already been told exactly "
+            "once. Simply answer whatever they actually asked, or ask if there's anything else."
+            + _caller_language_reply_hint(state)
         )
 
     # Merge any newly-passed fields.
@@ -2161,6 +2403,30 @@ async def confirm_booking(
         state.adults_7plus = int(adults_7plus)
     if kids_under7 >= 0:
         state.kids_under7 = int(kids_under7)
+
+    # PAST DATE/TIME GUARD — last line of defence. Checks the EFFECTIVE slot
+    # (whatever is on state now), not just this call's arguments, because a date
+    # can also reach state via _apply_spoken_datetime from raw ASR text. A booking
+    # written for a date that has already passed is worse than no booking: the
+    # caller gets a confirmation SMS for a day they cannot attend.
+    if state.appointment_date:
+        _nd, _nt, _derr = check_booking_not_past(
+            state.appointment_date, state.appointment_time or ""
+        )
+        if _derr:
+            logger.error(
+                "[PastDate] BLOCKED confirm_booking for date=%r time=%r — %s",
+                state.appointment_date, state.appointment_time, _derr.split(":")[0],
+            )
+            # Clear the bad value so the agent cannot re-confirm it unchanged.
+            state.appointment_date = ""
+            return (
+                _derr + " Do NOT say the booking is confirmed."
+                + _caller_language_reply_hint(state)
+            )
+        state.appointment_date = _nd
+        if _nt:
+            state.appointment_time = _nt
 
     # Required fields — ask for whatever is missing WITHOUT booking.
     name = state.patient_name or state.caller_name
@@ -2232,12 +2498,27 @@ async def confirm_booking(
         await save_call_transcript(user_id, transcript)
 
         price_words = f"{total_price:,}".replace(",", ",")
+        # ONE sentence, ONE time. This return used to script two utterances —
+        # a verbatim confirmation line AND "then read back once: name, date,
+        # slot, package, guests, total" — so the agent dutifully said the
+        # booking was confirmed and then restated the whole summary in the same
+        # breath. A tool result arriving at the moment of confirmation outweighs
+        # the system prompt, so this string, not the prompt, was what the caller
+        # actually heard. It also left a quotable confirmation line sitting in
+        # context, which the agent re-emitted again after the goodbye.
+        #
+        # Facts only now, and an explicit ban on repeating. No verbatim line to
+        # quote, no second utterance to perform.
         return (
-            f"SUCCESS. booking_id={booking_id}. The booking is written and the confirmation SMS has fired. "
-            f"NOW speak the confirmation line ('Perfect — your booking is confirmed! You'll get the confirmation "
-            f"SMS in just a moment.'), then read back once: name {name}, date {state.appointment_date}, slot "
-            f"{state.appointment_time}, package {state.package_name}, {headcount} guest(s), total about Rs. {price_words}. "
-            f"Do NOT mention any payment or link. Then ask if there's anything else." +
+            f"SUCCESS. booking_id={booking_id}. Booking written, confirmation SMS already sent. "
+            f"Details for your ONE confirmation sentence: name {name}, date {state.appointment_date}, "
+            f"slot {state.appointment_time}, package {state.package_name}, {headcount} guest(s), "
+            f"total about Rs. {price_words}. "
+            f"Say this ONCE, in your own words, as a SINGLE short sentence, then ask if there's "
+            f"anything else. Do NOT follow it with a summary or a read-back — the caller has already "
+            f"heard these details. Do NOT state the booking is confirmed again at any later point in "
+            f"this call unless the caller explicitly asks you to repeat it. "
+            f"Do NOT mention any payment or link." +
             _caller_language_reply_hint(state)
         )
     except Exception as e:
@@ -3798,6 +4079,25 @@ async def entrypoint(ctx: agents.JobContext):
             item = getattr(event, "item", None) or event
             role = getattr(item, "role", None)
             if role not in ("assistant", "agent"):
+                # A caller asking to hear it again re-arms the one permitted
+                # booking confirmation. Without this the once-only rule would gag
+                # the agent exactly when the caller genuinely missed it, which is
+                # a worse failure than the repetition it prevents.
+                if role == "user":
+                    try:
+                        _ut = getattr(item, "text_content", None)
+                        if callable(_ut):
+                            _ut = _ut()
+                        if _ut and asks_to_repeat(str(_ut)) and getattr(
+                            state, "booking_stated", False
+                        ):
+                            state.booking_stated = False
+                            logger.info(
+                                "[Issue6] Caller asked for a repeat — allowing the "
+                                "booking confirmation to be stated once more."
+                            )
+                    except Exception as _re:
+                        logger.debug("repeat-request check failed: %s", _re)
                 return
             text = getattr(item, "text_content", None)
             if callable(text):
@@ -3831,6 +4131,48 @@ async def entrypoint(ctx: agents.JobContext):
                 logger.warning(
                     "[Issue2] Agent generated an audibility/presence question: %r", text[:160]
                 )
+
+            # ISSUE 6 — the booking confirmation must be SPOKEN EXACTLY ONCE.
+            # Prompt and tool-result wording were both fixed, but wording alone
+            # did not hold on the reported call (three statements, one of them
+            # after the goodbye), so this is the code-level backstop.
+            #
+            # Two independent rules, either of which cuts the turn off:
+            #   A. a confirmation restated when one was already spoken
+            #   B. any second turn generated after the goodbye
+            # `states_booking_confirmed()` ignores "shall I confirm?" so the
+            # agent asking permission never burns the single allowed statement.
+            _kill = ""
+            try:
+                _wrapped = bool(_userdata.get("_wrapup_at"))
+                if _wrapped:
+                    _n = int(_userdata.get("_post_wrapup_turns") or 0) + 1
+                    _userdata["_post_wrapup_turns"] = _n
+                    # The closing line itself commits AFTER end_call runs, so the
+                    # first post-wrapup turn is the goodbye and must be allowed.
+                    if _n > 1:
+                        _kill = "speech after the goodbye line"
+
+                if states_booking_confirmed(text):
+                    if getattr(state, "booking_stated", False):
+                        _kill = _kill or "booking confirmation restated"
+                    else:
+                        state.booking_stated = True
+                        logger.info(
+                            "[Issue6] Booking confirmation stated (once): %r", text[:120]
+                        )
+            except Exception as _be:
+                logger.debug("booking-repeat guard failed: %s", _be)
+
+            if _kill:
+                logger.error(
+                    "[Issue6] Suppressing %s — cutting the turn: %r", _kill, text[:160]
+                )
+                try:
+                    session.interrupt(force=True)
+                except Exception as _ie:
+                    logger.warning("[Issue6] interrupt failed: %s", _ie)
+                return
 
             # ISSUE 3 — instruction leakage. Observed live: the agent recited its
             # own call-flow scaffolding, step number included. The prompt no longer

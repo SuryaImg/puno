@@ -723,3 +723,179 @@ whose call sites all require an STT or VAD event (audio_recognition.py:1078/1235
 This build has neither. Everything inside it — the language lock, `build_turn_snapshot`
 injection, `_maybe_auto_confirm_booking`, speculative-context injection — is dead code
 on the production model, and the log line at `agent.py:3041` never appears.
+
+# Round 8 — "your booking is confirmed", said three times
+
+Reported: the agent states the booking confirmation three times in one call — once
+on confirming, again as a full summary in the same breath, and a third time AFTER
+the goodbye line.
+
+## Root cause — the TOOL RESULTS were scripting the duplicates, not the prompt
+
+The prompt was a contributor, but not the driver. `confirm_booking()`'s success
+return literally instructed two utterances:
+
+```
+"NOW speak the confirmation line ('Perfect — your booking is confirmed! You'll get
+ the confirmation SMS in just a moment.'), then read back once: name {name}, date
+ {date}, slot {slot}, package {pkg}, {headcount} guest(s), total about Rs. {price}."
+```
+
+A tool result arriving at the moment of confirmation outweighs the system prompt, so
+**this string, not the prompt, is what the caller actually heard** — confirmation
+line, then the whole summary again. It also left a quotable verbatim line sitting in
+context for the model to re-emit later.
+
+The prompt said the same thing (`"...tell the caller plainly: '...' Then read back
+the essentials once — name, date, time slot, package, headcount"`), so both layers
+agreed on the wrong behaviour. That is the user's hypothesis 1, confirmed — with the
+correction that the tool return is the proximate cause.
+
+The third statement, after goodbye, is the user's hypothesis 3, confirmed:
+`end_call()` returns a **tool result** to the model, and every tool result provokes a
+fresh model turn. Its old wording ("The call will disconnect cleanly 1 second after
+you finish speaking the closing greeting") even gave that turn something to narrate.
+`_execute_end_call_drop()` then waits for speech to end, sleeps 1.0s, and allows up
+to 4s for the lead save — a **~5 second window** in which that extra turn is spoken
+before the line drops. The idempotency branch of `confirm_booking` made it worse by
+instructing "Reassure the caller their booking stands" — i.e. say it again.
+
+Hypothesis 2 (a separate summary/logging LLM call being spoken aloud) is **ruled
+out**: `log_call_summary` writes to storage and returns an internal note; nothing
+routes a second generation to TTS.
+
+## Fixes
+
+**Tool returns became data instead of scripts** (`agent.py`):
+- `confirm_booking` success: facts only, no verbatim line to quote, no read-back
+  list, and an explicit "say this ONCE as a SINGLE short sentence... do NOT state
+  the booking is confirmed again later unless the caller asks".
+- `confirm_booking` idempotency: "do NOT state that the booking is confirmed again".
+- `end_call`: terse `"Call ending. Say nothing further."`, and deliberately **no**
+  language hint — "speak in Hindi" next to "say nothing" is a contradiction that
+  invites the very turn being suppressed.
+
+**Prompt** (`puno_prompt.py`): the confirmation is now one sentence, one time, with
+an explicit ban on a following summary or any later restatement; and the closing
+line is declared the last thing said on the call.
+
+**Code-level hard block** (the part that does not rely on the model obeying) — in
+the existing output guard, two independent rules, either of which calls
+`session.interrupt(force=True)`:
+- a confirmation restated when `state.booking_stated` is already True
+- any second turn generated after `end_call` (the first is the goodbye itself,
+  which commits after the tool runs and must be allowed)
+
+`states_booking_confirmed()` deliberately distinguishes **stating** from **asking**:
+"क्या मैं इसे कंफर्म कर दूं?" / "shall I confirm?" is the correct permission-seeking
+turn and must never burn the one allowed statement.
+
+`asks_to_repeat()` re-arms one restatement when the caller genuinely asks to hear it
+again — without it, the once-only rule would gag the agent exactly when the caller
+missed it, which is a worse failure than the repetition.
+
+## Test
+
+Two simulated bookings with different headcounts, replayed through the real guard:
+
+    BOOKING 1 (7 people, Tourist Pass, Hindi — the reported call)
+      confirmations spoken: 1   turns after goodbye: 0   PASS
+    BOOKING 2 (3 people, Junior pass, English)
+      confirmations spoken: 1   turns after goodbye: 0   PASS
+    CONTROL (caller asks "can you repeat that?")
+      requested repeat allowed; the next unprompted one still blocked   PASS
+
+## Limitation
+
+`session.interrupt(force=True)` cuts the turn, it does not prevent it — a syllable or
+two may reach the caller before the cut. Prevention is the tool/prompt change; the
+interrupt is the backstop for when the model ignores both.
+
+# Round 9 — the agent accepted a booking for a date already past
+
+Reported: "agent should never take past date and time". Visible in the previous
+transcript, which booked **12 August 2026** on a call made **2 September 2026** —
+three weeks in the past.
+
+## Root cause — three failures stacked
+
+**1. The model was never told what day it is.** `build_agent_instructions()` injected
+the captured fields and the active language, but not the date. Nothing in the 33k-char
+prompt said what "today" was, so the agent had no way to know August was behind it.
+This is the root enabler: everything else is a missing backstop.
+
+**2. The booking tools wrote the date with zero validation.** Both
+`update_booking_details()` and `confirm_booking()` did:
+
+```python
+if date.strip():
+    state.appointment_date = date.strip()
+```
+
+Straight from the model's argument to state. No parse, no check, no normalisation.
+
+**3. The one validator that exists could not fire on this path.**
+`validate_and_normalize_appointment_datetime()` bails out immediately unless the date
+is already `YYYY-MM-DD` (`if not date_match: return date_str, time_str, None`), so a
+spoken "12 August 2026" or "12 अगस्त" was returned untouched. Its only live call site
+is `_apply_spoken_datetime()`, which inspects **raw ASR text**, never tool arguments —
+and its other call site is inside `on_user_turn_completed()`, which Round 7's audit
+established is **unreachable on Gemini 3.1**. It also enforces hospital OPD hours
+(9:00 AM–7:00 PM) when PUNO runs 11:30 AM–10:00 PM, so wiring it into the booking
+tools would have imported a second, unrelated bug.
+
+## Fix
+
+**`check_booking_not_past(date, time, *, now=None)`** — a focused new guard, separate
+from the hospital-era validator on purpose. It parses ISO, D/M/Y, "12 August 2026",
+"12 अगस्त", and relative words (today/tomorrow/parso, आज/कल/परसों), plus clock times
+in English and Hindi day-parts (सुबह/शाम/रात/दोपहर).
+
+Two design decisions worth stating:
+
+- **It fails OPEN.** Anything it cannot confidently resolve is allowed through.
+  Refusing a booking we merely failed to parse would be a worse bug than the one being
+  fixed, so only a slot positively known to be behind us is rejected.
+- **A year-less date rolls FORWARD.** On 2 September, "12 August" means next August.
+  Rejecting it would be wrong, and silently reading it as *this* year is exactly how
+  the reported call booked into the past.
+
+Wired in at both choke points: `update_booking_details()` refuses to STORE a past
+slot, and `confirm_booking()` re-checks the **effective** state (not just its own
+arguments, since a date can also arrive via `_apply_spoken_datetime`) and clears the
+bad value so the agent cannot re-confirm it unchanged.
+
+**Today's date is now injected into the live state every turn**, at the top of the
+stored-fields block, with the current IST time — plus a prompt rule that a month named
+without a year means its next occurrence.
+
+## A Devanagari trap worth recording
+
+`\b` does not work at the end of Devanagari words that end in a combining mark.
+`परसों` ends in U+0902 (anusvara) and the months `जनवरी` / `फरवरी` end in U+0940 —
+neither is a `\w` character, so a trailing `\b` never matches and the word silently
+fails to parse. Caught by testing; the first draft dropped `परसों`, `जनवरी` and
+`फरवरी` on the floor. Latin alternatives keep `\b`; Devanagari uses substring matching
+or the script-agnostic `_MONTH_END` lookahead.
+
+## Test
+
+Driven end-to-end through the real tools (today = 2 September 2026, 7:37 PM IST):
+
+    update_booking_details()          confirm_booking()
+      12 August 2026   BLOCKED          BLOCKED, booking_id=none
+      12 अगस्त 2026    BLOCKED          BLOCKED, booking_id=none
+      2026-08-12       BLOCKED          BLOCKED, booking_id=none
+      1/9/2026         BLOCKED          BLOCKED, booking_id=none
+      12 August        stored 2027-08-12   booked (rolled forward)
+      2026-12-25       stored 2026-12-25   booked
+      kal              stored 2026-09-03   booked
+    same-day boundary: 4:37 PM BLOCKED / 9:37 PM accepted
+
+## Adjacent defect, NOT fixed (out of scope)
+
+`validate_and_normalize_appointment_datetime()` still enforces `_OPD_OPEN_MINUTES`
+9:00 AM and `_OPD_CLOSE_MINUTES` 7:00 PM — Arora Hospital's OPD hours. PUNO Jaipur
+opens 11:30 AM and closes 10:00 PM, so on the spoken-date path that function will
+reject a valid 8:00 PM booking and accept an impossible 9:30 AM one. Left alone
+because this round was scoped to past dates.

@@ -534,6 +534,95 @@ def stall_recovery_line(lang: Optional[str], attempt: int = 0) -> str:
     return opts[min(max(int(attempt), 0), len(opts) - 1)]
 
 
+# ===========================================================================
+# "Your booking is confirmed" — must be STATED EXACTLY ONCE per call
+#
+# Observed live: the agent stated it three times — once on confirming, again as
+# a full summary in the same breath, and a third time AFTER the goodbye line.
+#
+# The discriminator that matters is STATEMENT vs QUESTION. "क्या मैं इसे कंफर्म
+# कर दूं?" ("shall I confirm it?") and "confirm kar doon?" are the agent ASKING
+# permission — the correct, expected turn — and must never be counted as the
+# one permitted statement, or the real confirmation that follows gets blocked.
+# ===========================================================================
+
+# Asking permission / future intent. Checked FIRST; wins over the statement
+# patterns, because "shall I confirm" contains "confirm" too.
+_BOOKING_CONFIRM_ASK_RE = re.compile(
+    r"""(
+        (?:shall|should|may|can|do\s+you\s+want|would\s+you\s+like)\s+(?:i|we)\b[^.?!]{0,30}confirm
+      | confirm\s+kar\s*(?:doon|dun|du|de\s*doon)\b
+      | कर\s*दूं | कर\s*दूँ | कर\s*दूंगी | कर\s*दूँगी
+      | करूं | करूँ
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# Stating that the booking IS confirmed (completed aspect).
+_BOOKING_CONFIRMED_RE = re.compile(
+    r"""(
+        (?:booking|slot|seat)s?\b[^.?!]{0,20}?\b(?:is|are|has\s+been|'s)\s+confirm
+      | \bbooking\s+confirmed\b
+      | \bconfirmed\s+(?:your|the)\s+booking\b
+        # Hinglish: "booking confirm ho gayi hai"
+      | confirm\s+ho\s+ga(?:yi|ya|ye)\b
+      | booking\s+confirm\s+ho\b
+        # Devanagari: "बुकिंग कंफर्म हो गई है", "बुकिंग कन्फर्म हो गयी"
+      | (?:कंफर्म | कन्फर्म
+           | कॉन्फर्म)
+          \s*हो\s*ग(?:ई|यी|या|ये)
+      | बुकिंग\s*(?:कंफर्म | कन्फर्म
+                    | कॉन्फर्म)
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def states_booking_confirmed(text: str) -> bool:
+    """True if `text` STATES the booking is confirmed (not asks to confirm it).
+
+    Used to enforce "say it exactly once": the first such turn is the real
+    confirmation, every later one is a duplicate the caller should never hear.
+    """
+    if not text:
+        return False
+    t = str(text).strip()
+    if len(t) < 3:
+        return False
+    if _BOOKING_CONFIRM_ASK_RE.search(t):
+        return False
+    return bool(_BOOKING_CONFIRMED_RE.search(t))
+
+
+# The caller explicitly asking to hear it again — the ONE case where restating a
+# confirmation is correct. Without this the once-only rule would gag the agent
+# when the caller genuinely missed it, which is worse than the repetition bug.
+_REPEAT_REQUEST_RE = re.compile(
+    r"""(
+        (?:repeat|say)\s+(?:that|it|again)
+      | \bcome\s+again\b
+      | \bonce\s+(?:more|again)\b
+      | (?:what|sorry)[^.?!]{0,15}\b(?:was\s+that|didn'?t\s+catch|missed\s+that)
+      | \bcan\s+you\s+(?:repeat|say)
+      | (?:phir|fir)\s*se\s*(?:bata|bol|kaho|kah)
+      | dobara\s*(?:bata|bol|kah)
+      | repeat\s+kar
+      | फिर\s*से\s*(?:बता | बोल
+                    | कह)
+      | दोबारा\s*(?:बता | बोल
+                   | कह)
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def asks_to_repeat(text: str) -> bool:
+    """True if the CALLER asked to hear something again."""
+    if not text:
+        return False
+    return bool(_REPEAT_REQUEST_RE.search(str(text)))
+
+
 def is_near_duplicate(a: str, b: str, threshold: float = 0.90) -> bool:
     """True if two agent turns are the same sentence said twice.
 

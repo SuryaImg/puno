@@ -190,6 +190,11 @@ class AppointmentState(BaseModel):
     # (goodbye / "bas itna hi" / "nothing else"). The end_call tool refuses to run
     # while this is False, so a confirmed booking can never hang up on its own.
     call_wrapup_ok: bool = Field(False, description="True once the caller has explicitly signalled the call can end")
+    # The caller must hear "your booking is confirmed" EXACTLY ONCE. Set the first
+    # time the agent actually states it; every later confirmation-style turn is a
+    # duplicate and is cut off at the code level (prompt rules alone did not hold —
+    # the agent stated it three times on the reported call, once after the goodbye).
+    booking_stated: bool = Field(False, description="True once the booking confirmation has been SPOKEN to the caller")
     name_confirmation_attempts: int = Field(0, description="Number of confirmation attempts for patient name")
 
     relation: str | None = Field(None, description="Patient relationship (e.g. self, mother, father, child, etc.)")
