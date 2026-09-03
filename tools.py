@@ -338,9 +338,24 @@ class AppointmentState(BaseModel):
         return "\n".join(steps) if steps else "No steps completed yet."
 
 
+# IST, not the host clock — see storage._now_ist_str(). Duplicated here rather
+# than imported because storage.py imports THIS module (importing back would be
+# circular). Same fixed +5:30 offset, same output format.
+_IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _now_ist_str() -> str:
+    """Current IST wall-clock as 'YYYY-MM-DD HH:MM:SS'."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .astimezone(_IST_TZ)
+        .strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+
 class TranscriptEntry(BaseModel):
     """A single event/entry in the call transcript."""
-    timestamp: str = Field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
+    timestamp: str = Field(default_factory=_now_ist_str)
     event_type: str = Field(
         description="Type: appointment_booked | callback_scheduled | step_completed | "
                     "error_reported | user_response | call_ended | reschedule_requested | "
@@ -357,7 +372,7 @@ class CallTranscript(BaseModel):
     """
     user_id: str
     call_start_time: str = Field(default_factory=lambda: str(int(time.time())))
-    call_start_human: str = Field(default_factory=lambda: time.strftime("%Y-%m-%d %H:%M:%S"))
+    call_start_human: str = Field(default_factory=_now_ist_str)
     call_end_time: str | None = None
     phone_number: str | None = None
 

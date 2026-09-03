@@ -204,3 +204,18 @@ Old code, replayed end_call sequence: 4s timeout → task cancelled → **no lea
 New code, same sequence: caller released in 0.42s, lead written 5s later with the
 full 30-turn transcript, `extraction_source=llm`, exactly one row. Also verified
 with `_store_clear()` fired at 0.4s, mid-drain: 30 turns still saved.
+
+### Timestamps are IST
+
+`created_at` (and `puno_booking.created_at`, `puno_call_log.timestamp`,
+`puno_sms.sent_at`, the `transcript:*` stamps, and the `call_id` suffix) were
+produced with `time.strftime()` / `datetime.now()` — the **host's** clock. On the
+UTC deployment VM that stored every record 5h30m behind the real call time (a lead
+saved at 12:40 IST was written as `"2026-09-03 07:10:31"`), while the same code on
+an IST machine looked correct — so the store held two different clocks at once.
+
+All of them now go through a fixed +5:30 helper (`storage._now_ist_str()`, mirrored
+in `tools.py` and `call_recording.py` to avoid a circular import), matching
+`agent._now_ist()`. Format is unchanged — `YYYY-MM-DD HH:MM:SS` — only the value
+moves, so existing consumers parse it exactly as before. **Rows written before this
+change keep their original values.**

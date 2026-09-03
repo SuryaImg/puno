@@ -42,7 +42,7 @@ LEAD_RECORD_SCHEMA: dict[str, Any] = {
         # identity / bookkeeping
         "lead_id": {"type": "string", "description": "LEAD###### — assigned on save"},
         "type": {"type": "string", "const": "PUNO_LEAD"},
-        "created_at": {"type": "string", "description": "YYYY-MM-DD HH:MM:SS"},
+        "created_at": {"type": "string", "description": "YYYY-MM-DD HH:MM:SS in IST (assigned on save)"},
         "call_id": {"type": ["string", "null"]},
         # classification (NEW — present on every lead)
         "lead_quality": {"type": "string", "enum": list(LEAD_QUALITIES)},
