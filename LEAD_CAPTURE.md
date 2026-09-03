@@ -82,7 +82,9 @@ python test_lead_capture.py   # 35 checks: HOT / WARM / COLD, each also with the
 ```
 
 New env knobs: `LEAD_EXTRACTION_MODEL` (default `gemini-2.5-flash`),
-`LEAD_EXTRACTION_TIMEOUT_S` (20).
+`LEAD_EXTRACTION_TIMEOUT_S` (10, now actually applied as an HTTP timeout),
+`LEAD_EXTRACTION_THINKING_BUDGET` (0), `LEAD_SAVE_DRAIN_MAX_S` (15),
+`SHUTDOWN_PROCESS_TIMEOUT` (30).
 
 ---
 
@@ -139,3 +141,66 @@ shutdown path already flushes unconditionally, so nothing would be lost.
 ```bash
 python test_lead_race.py      # late-final drain, no-late-turn latency, idempotency
 ```
+
+---
+
+## Correction 2 — `puno_lead` was empty while `puno_call_log` filled up
+
+Reported symptom: call logs were landing in Redis, leads were not.
+
+### Cause A — teardown cancelled the lead save
+
+`_execute_end_call_drop` gave the finalizer a 4s budget
+(`END_CALL_LEAD_MAX_S`), then disconnected, on the stated assumption that the
+shielded task "continues in the background". It did not. The task was registered
+in `_TOOL_BG_TASKS`, and `_graceful_disconnect` cancels that entire set moments
+later. `asyncio.shield` only stops the *waiter's* cancellation propagating —
+cancelling the task itself still kills it. `_lead_finalized` had already been
+claimed, so the shutdown backstop then skipped the retry and no lead was written
+at all. The call log was unaffected because it is written mid-call.
+
+### Cause B — the extraction could never fit in 4s
+
+`gemini-2.5-flash` thinks by default. Measured on a real 30-turn PUNO call:
+**20.5s with thinking on, 4.0s with `thinking_budget=0`** for the same extracted
+fields. So the 4s budget expired on essentially every call.
+`LEAD_EXTRACTION_TIMEOUT_S` was declared but never passed to the SDK, so a
+stalled request had no ceiling either.
+
+### Fix
+
+`finalize_lead_for_call` is split into two phases:
+
+| phase | work | must finish before teardown? |
+|---|---|---|
+| `_collect_lead_inputs` | transcript drain + state snapshot (~0.4s, no network) | **yes** — reads the live store |
+| `_build_and_save_lead` | LLM extraction + Redis write (~5s) | no — works off the snapshot |
+
+`background=True` (used by `end_call` and the silence hangup) awaits phase 1 only
+and parks phase 2 in **`_LEAD_TASKS`** — a set teardown *awaits* rather than
+cancels (`_await_pending_lead_saves`, ≤`LEAD_SAVE_DRAIN_MAX_S`). Cancelling a
+lead save now also releases the `_lead_finalized` claim so a later path can retry,
+and the minimal-record fallback records its `lead_id` on userdata.
+
+Extraction runs with `thinking_budget=0` and a real HTTP timeout. A timeout is no
+longer a lost lead: `build_lead_record` falls back to the deterministic classifier.
+
+`shutdown_process_timeout` is raised from the SDK default 10s to 30s — the job's
+shutdown callbacks (lead drain + the recorder's audio/transcript persistence) did
+not fit in 10s, and the lead save was what got cut off.
+
+### Also corrected
+
+Correction 2 above claimed shutdown callbacks "run in registration order". In the
+installed SDK they are **gathered concurrently**
+(`ipc/job_proc_lazy_main.py`), so registering the backstop before
+`recorder.attach()` does not by itself protect the read: `_store_clear()` can land
+mid-drain. The drain now keeps a running best snapshot and bails out the moment
+the store empties, which makes it monotonic regardless of ordering.
+
+### Verified
+
+Old code, replayed end_call sequence: 4s timeout → task cancelled → **no lead**.
+New code, same sequence: caller released in 0.42s, lead written 5s later with the
+full 30-turn transcript, `extraction_source=llm`, exactly one row. Also verified
+with `_store_clear()` fired at 0.4s, mid-drain: 30 turns still saved.

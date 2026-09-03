@@ -342,7 +342,16 @@ def normalise_lead_quality(v) -> Optional[str]:
 # Default LLM backend (injectable — tests pass their own generate_fn)
 # ---------------------------------------------------------------------------
 LEAD_EXTRACTION_MODEL = os.environ.get("LEAD_EXTRACTION_MODEL", "gemini-2.5-flash")
-LEAD_EXTRACTION_TIMEOUT_S = float(os.environ.get("LEAD_EXTRACTION_TIMEOUT_S", "20"))
+# Default 10s, not 20s: this runs during job shutdown, where the whole process has a
+# bounded grace period. A timeout here is not a lost lead — build_lead_record catches
+# it and falls back to the deterministic classifier — so failing fast beats hanging.
+LEAD_EXTRACTION_TIMEOUT_S = float(os.environ.get("LEAD_EXTRACTION_TIMEOUT_S", "10"))
+# Extraction is pure field-copying out of a transcript against a fixed schema; it does
+# not benefit from a reasoning pass. gemini-2.5-flash thinks by default, and measured
+# on a real 30-turn PUNO call that cost 20.5s versus 4.0s with thinking off, for the
+# same extracted fields. That 20s was the whole problem: it blew every end-of-call
+# budget the agent has.
+LEAD_EXTRACTION_THINKING_BUDGET = int(os.environ.get("LEAD_EXTRACTION_THINKING_BUDGET", "0"))
 
 
 def _gemini_generate(prompt: str) -> str:
@@ -354,13 +363,26 @@ def _gemini_generate(prompt: str) -> str:
     # of the project (see genai_routing.py). LEAD_EXTRACTION_MODEL is a plain text
     # model, so today this still honours GOOGLE_GENAI_USE_VERTEXAI as before.
     client = _genai_client_for(LEAD_EXTRACTION_MODEL)
+
+    cfg_kwargs: dict[str, Any] = {
+        "temperature": 0.1,
+        "response_mime_type": "application/json",
+        # LEAD_EXTRACTION_TIMEOUT_S was declared but never applied, so a stalled
+        # request had no ceiling at all. google-genai takes http timeouts in ms.
+        "http_options": _t.HttpOptions(timeout=int(LEAD_EXTRACTION_TIMEOUT_S * 1000)),
+    }
+    if LEAD_EXTRACTION_THINKING_BUDGET >= 0:
+        try:
+            cfg_kwargs["thinking_config"] = _t.ThinkingConfig(
+                thinking_budget=LEAD_EXTRACTION_THINKING_BUDGET
+            )
+        except Exception:  # model/SDK without thinking support — plain call is fine
+            pass
+
     resp = client.models.generate_content(
         model=LEAD_EXTRACTION_MODEL,
         contents=prompt,
-        config=_t.GenerateContentConfig(
-            temperature=0.1,
-            response_mime_type="application/json",
-        ),
+        config=_t.GenerateContentConfig(**cfg_kwargs),
     )
     return getattr(resp, "text", "") or ""
 

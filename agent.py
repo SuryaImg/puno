@@ -118,6 +118,39 @@ _GEMINI_FALLBACK_MODEL = "gemini-live-2.5-flash-native-audio"
 # set when an agent is available, so disconnect cancels them.
 _TOOL_BG_TASKS: set = set()
 
+# The end-of-call lead save is DELIBERATELY NOT in _TOOL_BG_TASKS. That set is
+# cancelled wholesale by _graceful_disconnect, and the lead save used to live in
+# it — so on every call that ended via end_call() the sequence was:
+#   end_call -> lead task starts -> 4s budget expires -> room.disconnect()
+#   -> _graceful_disconnect -> cancels _TOOL_BG_TASKS -> lead task killed
+#   -> shutdown backstop sees _lead_finalized=True and skips -> NO LEAD WRITTEN.
+# Lead saves are the one piece of background work that must OUTLIVE teardown, so
+# they get their own set which teardown awaits instead of cancelling.
+_LEAD_TASKS: set = set()
+
+
+async def _await_pending_lead_saves(timeout: float = 30.0) -> None:
+    """Block until every in-flight lead save has finished (or `timeout` elapses).
+
+    Called from the disconnect handler and the job shutdown callback. Never
+    cancels — a cancelled lead save is a lost lead, which is the bug this exists
+    to prevent.
+    """
+    pending = [t for t in list(_LEAD_TASKS) if not t.done()]
+    if not pending:
+        return
+    logger.info("[Lead] waiting up to %.1fs for %d in-flight lead save(s).", timeout, len(pending))
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(asyncio.gather(*pending, return_exceptions=True)), timeout=timeout
+        )
+        logger.info("[Lead] in-flight lead save(s) completed.")
+    except asyncio.TimeoutError:
+        logger.error("[Lead] lead save(s) still running after %.1fs — proceeding with teardown.", timeout)
+    except Exception as _e:
+        logger.warning("[Lead] error while awaiting lead saves: %s", _e)
+
+
 # --- Single source of truth for "what time is it right now" -----------------
 # Arora Hospital operates on India Standard Time regardless of what timezone
 # the host server happens to be running in (a common source of bugs: a VM
@@ -1912,24 +1945,32 @@ async def _execute_end_call_drop(userdata: dict):
     # 3. Short beat after the greeting completes before cutting the call
     await asyncio.sleep(1.0)
 
-    # Write the lead BEFORE teardown (room.disconnect() -> session close clears the
-    # transcript store the extractor reads) — but NEVER let it hold the call open.
+    # Snapshot the lead inputs BEFORE teardown (room.disconnect() -> session close
+    # clears the transcript store the extractor reads), then let the slow half —
+    # LLM extraction + Redis write — finish on its own time.
+    #
     # ISSUE 4, second cause: this await was unbounded, and finalize does a transcript
     # drain plus an LLM extraction, so a slow model kept the caller connected for
-    # seconds after goodbye. Shielded so the save still completes in the background
-    # if we stop waiting for it.
+    # seconds after goodbye. The fix for that was a 4s budget with the task shielded
+    # so it "continues in the background" — but the task was registered in
+    # _TOOL_BG_TASKS, which _graceful_disconnect cancels wholesale moments later.
+    # asyncio.shield only stops the WAITER's cancellation propagating; cancelling the
+    # task itself still kills it. Extraction takes ~4-20s, so the 4s budget expired on
+    # essentially every call and the lead was killed with the room — the call log was
+    # written (that happens mid-call) while puno_lead stayed empty.
+    #
+    # background=True awaits only the fast, teardown-sensitive phase here, so the
+    # caller is still released promptly, and parks the slow phase in _LEAD_TASKS,
+    # which teardown awaits instead of cancelling.
     try:
-        _lead_task = asyncio.ensure_future(finalize_lead_for_call(userdata, reason="end_call"))
-        _TOOL_BG_TASKS.add(_lead_task)
-        _lead_task.add_done_callback(_TOOL_BG_TASKS.discard)
         await asyncio.wait_for(
-            asyncio.shield(_lead_task),
+            finalize_lead_for_call(userdata, reason="end_call", background=True),
             timeout=float(os.environ.get("END_CALL_LEAD_MAX_S", "4.0")),
         )
     except asyncio.TimeoutError:
         logger.warning(
-            "[Issue4] Lead finalize exceeded its budget — disconnecting now; the save "
-            "continues in the background."
+            "[Issue4] Lead input collection exceeded its budget — disconnecting now; "
+            "the save continues in the background."
         )
     except Exception as _le:
         logger.error("[Lead] finalize on end_call failed: %s", _le)
@@ -2040,82 +2081,114 @@ def _puno_total_headcount(state: AppointmentState) -> int:
 # lead HOT/WARM/COLD. It never raises and always writes a record.
 # ===========================================================================
 
-async def finalize_lead_for_call(userdata: dict, *, reason: str = "call_ended") -> Optional[str]:
-    """Build + save the end-of-call lead. Idempotent: only the first call does work."""
-    if not isinstance(userdata, dict):
-        return None
-    if userdata.get("_lead_finalized"):
-        logger.debug("[Lead] finalize skipped (already done, reason=%s)", reason)
-        return userdata.get("_lead_id")
-    userdata["_lead_finalized"] = True  # claim BEFORE any await — prevents double-fire
+async def _collect_lead_inputs(userdata: dict, *, reason: str) -> dict:
+    """PHASE 1 — fast, and the only phase that must finish before teardown.
 
+    Everything here reads live in-process state that teardown destroys: the
+    transcript store (cleared at the end of the recorder's _on_shutdown) and
+    AppointmentState. It is bounded by the drain cap (~1.5s) and does no network
+    I/O, so it is safe to await inline on the disconnect path.
+
+    Phase 2 (the LLM extraction + Redis write) needs none of that live state — it
+    only needs the plain dict this returns — which is what lets the save outlive
+    the call instead of being cancelled with it.
+    """
     state = userdata.get("state")
     _call_id = userdata.get("call_id") or ""
+
+    try:
+        from call_recording import get_conversation, transcript_turn_count
+
+        # TRANSCRIPT DRAIN. The caller's LAST turn only lands in the store once
+        # the realtime provider emits a FINAL input transcription, and the SDK
+        # documents that a provider may withhold that final until its reply has
+        # finished generating. Snapshotting at t=0 of the disconnect therefore
+        # drops the most valuable turn on exactly the calls that matter most —
+        # "same number, book me for Saturday" *click* — leaving the fields null
+        # and the lead misclassified. Wait until the store stops growing (or the
+        # cap elapses) before reading. This still completes long before
+        # session.aclose()/ctx.shutdown(), which is when the store is cleared,
+        # and _lead_finalized was already claimed by the caller so the backstop
+        # cannot double-fire while we wait.
+        _max_wait = float(os.environ.get("LEAD_TRANSCRIPT_DRAIN_MAX_S", "1.5"))
+        _quiet_for = float(os.environ.get("LEAD_TRANSCRIPT_DRAIN_QUIET_S", "0.35"))
+        _poll = 0.1
+        _last = transcript_turn_count(_call_id)
+        _waited = _stable = 0.0
+        # Snapshot on every poll and keep the longest. The SDK runs job shutdown
+        # callbacks CONCURRENTLY (asyncio.gather in job_proc_lazy_main), not in
+        # registration order, so on the shutdown-backstop path the recorder's
+        # _on_shutdown -> _store_clear() can land WHILE this loop is still polling.
+        # Reading only after the loop would then return an empty transcript and
+        # write a contentless lead. Holding the best snapshot makes the drain
+        # monotonic: a concurrent clear can no longer take anything away.
+        turns = get_conversation(_call_id)
+        while _waited < _max_wait:
+            await asyncio.sleep(_poll)
+            _waited += _poll
+            _now = transcript_turn_count(_call_id)
+            if _now:
+                _snap = get_conversation(_call_id)
+                if len(_snap) >= len(turns):
+                    turns = _snap
+            elif turns:
+                logger.warning(
+                    "[Lead] transcript store emptied mid-drain — using the %d-turn "
+                    "snapshot already held (reason=%s).", len(turns), reason,
+                )
+                break
+            if _now != _last:
+                _last, _stable = _now, 0.0
+            else:
+                _stable += _poll
+                if _stable >= _quiet_for:
+                    break
+        logger.info(
+            "[Lead] transcript drained: %d turns after %.1fs (reason=%s)",
+            len(turns), _waited, reason,
+        )
+    except Exception as _te:
+        logger.warning("[Lead] could not read transcript store: %s", _te)
+        turns = []
+
+    snapshot = {}
+    if state is not None:
+        snapshot = {
+            "name": getattr(state, "patient_name", None) or getattr(state, "caller_name", None),
+            "phone": getattr(state, "patient_phone", None),
+            "package_interest": getattr(state, "package_name", None) or getattr(state, "reason", None),
+            "preferred_date": getattr(state, "appointment_date", None),
+            "preferred_slot": getattr(state, "appointment_time", None),
+            "adults_7plus": getattr(state, "adults_7plus", None),
+            "kids_under7": getattr(state, "kids_under7", None),
+            "intent": getattr(state, "call_category", None),
+        }
+
+    return {
+        "turns": turns,
+        "state": snapshot,
+        "caller_id": _sip_caller_mobile(userdata),
+        "today": _today_ist().strftime("%Y-%m-%d"),
+        "booking_id": getattr(state, "booking_id", None) if state is not None else None,
+        "outcome": getattr(state, "call_outcome", None) if state is not None else None,
+        "transferred": bool(getattr(state, "transferred_to_human", False)) if state is not None else False,
+        "language": getattr(state, "caller_language", None) if state is not None else None,
+        "call_id": userdata.get("call_id"),
+    }
+
+
+async def _build_and_save_lead(inputs: dict, userdata: dict, *, reason: str) -> Optional[str]:
+    """PHASE 2 — slow, and safe to run after the caller is gone.
+
+    Works purely off the `inputs` snapshot: an LLM extraction (seconds) plus the
+    Redis write. Nothing here touches the session, the room or the transcript
+    store, so it may legitimately outlive them.
+    """
+    state = userdata.get("state")
     try:
         from lead_capture import build_lead_record
-        try:
-            from call_recording import get_conversation, transcript_turn_count
 
-            # TRANSCRIPT DRAIN. The caller's LAST turn only lands in the store once
-            # the realtime provider emits a FINAL input transcription, and the SDK
-            # documents that a provider may withhold that final until its reply has
-            # finished generating. Snapshotting at t=0 of the disconnect therefore
-            # drops the most valuable turn on exactly the calls that matter most —
-            # "same number, book me for Saturday" *click* — leaving the fields null
-            # and the lead misclassified. Wait until the store stops growing (or the
-            # cap elapses) before reading. This still completes long before
-            # session.aclose()/ctx.shutdown(), which is when the store is cleared,
-            # and _lead_finalized was already claimed above so the backstop cannot
-            # double-fire while we wait.
-            _max_wait = float(os.environ.get("LEAD_TRANSCRIPT_DRAIN_MAX_S", "1.5"))
-            _quiet_for = float(os.environ.get("LEAD_TRANSCRIPT_DRAIN_QUIET_S", "0.35"))
-            _poll = 0.1
-            _last = transcript_turn_count(_call_id)
-            _waited = _stable = 0.0
-            while _waited < _max_wait:
-                await asyncio.sleep(_poll)
-                _waited += _poll
-                _now = transcript_turn_count(_call_id)
-                if _now != _last:
-                    _last, _stable = _now, 0.0
-                else:
-                    _stable += _poll
-                    if _stable >= _quiet_for:
-                        break
-            logger.info(
-                "[Lead] transcript drained: %d turns after %.1fs (reason=%s)",
-                _last, _waited, reason,
-            )
-            turns = get_conversation(_call_id)
-        except Exception as _te:
-            logger.warning("[Lead] could not read transcript store: %s", _te)
-            turns = []
-
-        snapshot = {}
-        if state is not None:
-            snapshot = {
-                "name": getattr(state, "patient_name", None) or getattr(state, "caller_name", None),
-                "phone": getattr(state, "patient_phone", None),
-                "package_interest": getattr(state, "package_name", None) or getattr(state, "reason", None),
-                "preferred_date": getattr(state, "appointment_date", None),
-                "preferred_slot": getattr(state, "appointment_time", None),
-                "adults_7plus": getattr(state, "adults_7plus", None),
-                "kids_under7": getattr(state, "kids_under7", None),
-                "intent": getattr(state, "call_category", None),
-            }
-
-        record = await asyncio.to_thread(
-            build_lead_record,
-            turns=turns,
-            state=snapshot,
-            caller_id=_sip_caller_mobile(userdata),
-            today=_today_ist().strftime("%Y-%m-%d"),
-            booking_id=getattr(state, "booking_id", None) if state is not None else None,
-            outcome=getattr(state, "call_outcome", None) if state is not None else None,
-            transferred=bool(getattr(state, "transferred_to_human", False)) if state is not None else False,
-            language=getattr(state, "caller_language", None) if state is not None else None,
-            call_id=userdata.get("call_id"),
-        )
+        record = await asyncio.to_thread(build_lead_record, **inputs)
         record["end_reason"] = reason
 
         lead_id = await save_puno_lead(record)
@@ -2132,27 +2205,76 @@ async def finalize_lead_for_call(userdata: dict, *, reason: str = "call_ended") 
             record.get("turn_count"), reason,
         )
         return lead_id
+    except asyncio.CancelledError:
+        # Release the idempotency claim so a later path (the shutdown backstop)
+        # can still write this lead. Swallowing the claim on cancellation is
+        # precisely how leads went missing before.
+        userdata["_lead_finalized"] = False
+        logger.error("[Lead] save CANCELLED (reason=%s) — claim released for retry.", reason)
+        raise
     except Exception as e:
         logger.error("[Lead] finalize FAILED (%s) — attempting minimal record.", e)
         # Absolute last resort: never lose the call entirely.
         try:
+            _caller = inputs.get("caller_id") or _sip_caller_mobile(userdata)
             minimal = {
                 "type": "PUNO_LEAD",
                 "lead_quality": "COLD",
                 "reasoning": f"Lead finalization failed: {e}",
-                "phone": _sip_caller_mobile(userdata) or None,
-                "phone_source": "caller_id" if _sip_caller_mobile(userdata) else "none",
+                "phone": _caller or None,
+                "phone_source": "caller_id" if _caller else "none",
                 "notes": "",
                 "outcome": "Info only",
                 "extraction_source": "rule_based_fallback",
                 "payment_status": "n/a",
                 "end_reason": reason,
-                "call_id": userdata.get("call_id"),
+                "call_id": inputs.get("call_id") or userdata.get("call_id"),
             }
-            return await save_puno_lead(minimal)
+            lead_id = await save_puno_lead(minimal)
+            userdata["_lead_id"] = lead_id
+            logger.info("[Lead] minimal record saved %s (reason=%s)", lead_id, reason)
+            return lead_id
         except Exception as e2:
             logger.error("[Lead] minimal lead save also failed: %s", e2)
             return None
+
+
+async def finalize_lead_for_call(
+    userdata: dict, *, reason: str = "call_ended", background: bool = False
+) -> Optional[str]:
+    """Build + save the end-of-call lead. Idempotent: only the first call does work.
+
+    `background=True` awaits only phase 1 (which must happen while the transcript
+    store is alive) and hands phase 2 to a task in _LEAD_TASKS. Use it on the
+    end_call path, where the caller must not be held on the line while an LLM
+    thinks; teardown then AWAITS that task rather than cancelling it.
+    """
+    if not isinstance(userdata, dict):
+        return None
+    if userdata.get("_lead_finalized"):
+        logger.debug("[Lead] finalize skipped (already done, reason=%s)", reason)
+        return userdata.get("_lead_id")
+    userdata["_lead_finalized"] = True  # claim BEFORE any await — prevents double-fire
+
+    try:
+        inputs = await _collect_lead_inputs(userdata, reason=reason)
+    except asyncio.CancelledError:
+        userdata["_lead_finalized"] = False
+        raise
+    except Exception as e:
+        logger.error("[Lead] input collection failed (%s) — saving from caller id only.", e)
+        inputs = {"turns": [], "state": {}, "caller_id": _sip_caller_mobile(userdata),
+                  "today": _today_ist().strftime("%Y-%m-%d"), "booking_id": None,
+                  "outcome": None, "transferred": False, "language": None,
+                  "call_id": userdata.get("call_id")}
+
+    if background:
+        task = asyncio.ensure_future(_build_and_save_lead(inputs, userdata, reason=reason))
+        _LEAD_TASKS.add(task)
+        task.add_done_callback(_LEAD_TASKS.discard)
+        return None
+
+    return await _build_and_save_lead(inputs, userdata, reason=reason)
 
 
 # --- Info tools -------------------------------------------------------------
@@ -3872,14 +3994,23 @@ async def entrypoint(ctx: agents.JobContext):
     # participant_disconnected handler (silence hangup, end_call, session error).
     # finalize_lead_for_call is idempotent, so whichever path runs first wins.
     #
-    # REGISTRATION ORDER MATTERS. ctx shutdown callbacks run in registration order,
-    # and the recorder's own _on_shutdown ends by calling _store_clear(), which wipes
-    # the transcript this finalizer reads. So this MUST be registered before
-    # recorder.attach() — otherwise, on any ending that reaches ctx.shutdown()
-    # without passing through one of the explicit pre-teardown calls, the backstop
-    # would run against an already-cleared store and save an empty lead.
+    # This is registered before recorder.attach() on purpose. The recorder's own
+    # _on_shutdown ends by calling _store_clear(), which wipes the transcript this
+    # finalizer reads. NOTE: the installed SDK gathers shutdown callbacks
+    # CONCURRENTLY (ipc/job_proc_lazy_main.py) rather than running them in
+    # registration order, so ordering alone does not protect the read — the drain in
+    # _collect_lead_inputs keeps a running best snapshot for exactly that reason.
+    # Registering first still helps (this callback gets to start first).
     async def _lead_shutdown_backstop(*_a, **_kw):
         try:
+            # A save already in flight (end_call parks one in _LEAD_TASKS) must be
+            # allowed to land before the job exits — otherwise the process tears the
+            # loop down mid-write and the lead is lost even though nothing cancelled
+            # it explicitly. finalize is idempotent, so the call below is a no-op
+            # whenever a save has already run or is still running.
+            await _await_pending_lead_saves(
+                timeout=float(os.environ.get("LEAD_SAVE_DRAIN_MAX_S", "15.0"))
+            )
             await finalize_lead_for_call(_userdata, reason="shutdown")
         except Exception as _e:
             logger.error("[Lead] shutdown backstop failed: %s", _e)
@@ -4356,10 +4487,15 @@ async def entrypoint(ctx: agents.JobContext):
         async def _hangup_due_to_silence():
             logger.info("Caller unresponsive after silence check-ins — ending call immediately.")
             _disconnect_event.set()
-            # Same ordering rule as end_call: the lead must be built while the
-            # transcript store still exists (session.aclose() below clears it).
+            # Same ordering rule as end_call: the lead INPUTS must be snapshotted
+            # while the transcript store still exists (session.aclose() below clears
+            # it). background=True does exactly that and defers the LLM extraction,
+            # so an unresponsive caller is not held on a dead line for the length of
+            # a model round-trip; the shutdown backstop waits for the save to land.
             try:
-                await finalize_lead_for_call(_userdata, reason="silence_hangup")
+                await finalize_lead_for_call(
+                    _userdata, reason="silence_hangup", background=True
+                )
             except Exception as _le:
                 logger.error("[Lead] finalize on silence hangup failed: %s", _le)
             for task in list(_background_tasks):
@@ -5150,6 +5286,15 @@ async def entrypoint(ctx: agents.JobContext):
             await asyncio.gather(*_all_bg, return_exceptions=True)
             logger.info("Background tasks cancelled during disconnect.")
 
+        # 1b. Lead saves are the ONE kind of background work that must survive this
+        #     handler. end_call() parks the slow half of the lead write in
+        #     _LEAD_TASKS (never _TOOL_BG_TASKS, which the loop above cancels) —
+        #     wait for it rather than killing it. finalize above already claimed
+        #     idempotency, so nothing here can double-write.
+        await _await_pending_lead_saves(
+            timeout=float(os.environ.get("LEAD_SAVE_DRAIN_MAX_S", "15.0"))
+        )
+
         # 2. Small buffer for in-flight capture_frame calls to observe the
         #    per-recorder shutdown flag set by the recorder's disconnect handler.
         await asyncio.sleep(0.3)
@@ -5213,6 +5358,12 @@ if __name__ == "__main__":
             num_idle_processes=int(os.environ.get("NUM_IDLE_PROCESSES", "0")),
             # agent.py is large — cold import + prewarm can exceed the SDK default 10s.
             initialize_process_timeout=float(os.environ.get("INIT_PROCESS_TIMEOUT", "30")),
+            # The SDK default is 10s, and the job's shutdown callbacks must ALL fit
+            # inside it or the supervisor kills the process mid-write. Ours are the
+            # lead save drain (<=LEAD_SAVE_DRAIN_MAX_S, 15s) followed by the
+            # recorder's audio + transcript persistence, so 10s was not enough for
+            # both — the lead save is what got cut off.
+            shutdown_process_timeout=float(os.environ.get("SHUTDOWN_PROCESS_TIMEOUT", "30")),
             port=8989,
         )
     )
