@@ -9,6 +9,7 @@ Key schema:
 """
 
 import asyncio
+import datetime
 import json
 import logging
 import os
@@ -438,6 +439,32 @@ async def generate_lead_id() -> str:
     return await _generate_prefixed_id("LEAD", "puno_lead")
 
 
+# ── Record timestamps ─────────────────────────────────────────────────────────
+# PUNO Jaipur is in India, so every timestamp a human reads out of Redis must be
+# IST. These were `time.strftime(...)`, i.e. the HOST's local clock — correct on
+# a dev laptop set to IST, but the agent runs on a UTC VM, so every stored
+# created_at/timestamp/sent_at was 5h30m behind the real call time (a lead saved
+# at 12:40 IST was written as "07:10:31").
+#
+# Mirrors agent._now_ist(): a fixed +5:30 offset rather than an IANA zone lookup
+# (IST has no DST, and this cannot then depend on the tz database being present
+# and correct on the host). Kept as a naive "%Y-%m-%d %H:%M:%S" string so the
+# stored format is byte-for-byte what every existing consumer already parses —
+# only the value moves.
+_IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _now_ist_str() -> str:
+    """Current IST wall-clock as 'YYYY-MM-DD HH:MM:SS'. Use for every timestamp
+    written into a PUNO record — never time.strftime()/datetime.now(), which
+    silently follow the server's timezone."""
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .astimezone(_IST)
+        .strftime("%Y-%m-%d %H:%M:%S")
+    )
+
+
 async def _save_puno_record(key: str, record: dict) -> None:
     """Write a JSON record to Redis, falling back to process memory on failure."""
     payload = json.dumps(record, default=str)
@@ -467,7 +494,7 @@ async def save_puno_booking(record: dict) -> str:
     record["booking_id"] = booking_id
     record.setdefault("type", "PUNO_BOOKING")
     record.setdefault("payment_status", "n/a")
-    record.setdefault("created_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+    record.setdefault("created_at", _now_ist_str())
     await _save_puno_record(f"puno_booking:{booking_id}", record)
     return booking_id
 
@@ -477,7 +504,7 @@ async def save_puno_lead(record: dict) -> str:
     lead_id = record.get("lead_id") or await generate_lead_id()
     record["lead_id"] = lead_id
     record.setdefault("type", "PUNO_LEAD")
-    record.setdefault("created_at", time.strftime("%Y-%m-%d %H:%M:%S"))
+    record.setdefault("created_at", _now_ist_str())
     await _save_puno_record(f"puno_lead:{lead_id}", record)
     return lead_id
 
@@ -495,7 +522,7 @@ async def save_puno_call_log(record: dict) -> str:
     )
     record.setdefault("type", "PUNO_CALL_LOG")
     record.setdefault("payment_status", "n/a")
-    record.setdefault("timestamp", time.strftime("%Y-%m-%d %H:%M:%S"))
+    record.setdefault("timestamp", _now_ist_str())
     await _save_puno_record(f"puno_call_log:{log_id}", record)
     return log_id
 
@@ -515,7 +542,7 @@ async def save_dummy_sms(booking_id: str, phone: str, body: str) -> None:
         "body": body,
         "channel": "SMS",
         "status": "SENT (dummy)",
-        "sent_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "sent_at": _now_ist_str(),
     }
     logger.info("DUMMY confirmation SMS to %s for booking %s: %s", phone, booking_id, body)
     await _save_puno_record(f"puno_sms:{booking_id}", record)

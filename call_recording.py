@@ -72,10 +72,22 @@ def _utc_iso() -> str:
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+# Every wall-clock timestamp this module produces is IST, matching the records in
+# Redis (see storage._now_ist_str()). datetime.now() follows the HOST timezone, so
+# on the UTC deployment VM a call_id read "…-20260903-071031" while the same call's
+# lead said 12:40 IST — the two could not be lined up by eye.
+_IST_TZ = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+
+
+def _now_ist() -> datetime.datetime:
+    """Current IST wall clock as a naive datetime (tzinfo stripped)."""
+    return datetime.datetime.now(datetime.timezone.utc).astimezone(_IST_TZ).replace(tzinfo=None)
+
+
 def _write_debug_log(msg: str) -> None:
     try:
         log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug_recording.txt")
-        timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        timestamp = _now_ist().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"[{timestamp}] {msg}\n")
     except Exception:
@@ -550,7 +562,10 @@ def derive_call_id(room: rtc.Room, user_id: str) -> str:
     Uses the LiveKit room name when available; falls back to
     ``lk_<user_id>_<epoch>`` so filenames are always unique.
     """
-    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    # IST — the call_id is embedded in every lead/call-log record and in the
+    # recording/transcript filenames, so it must read on the same clock as
+    # `created_at`. Only affects new calls; existing files keep their names.
+    timestamp = _now_ist().strftime("%Y%m%d-%H%M%S")
     room_name = getattr(room, "name", "") or ""
     if room_name:
         clean_name = re.sub(r"[^a-zA-Z0-9_\-]", "_", room_name)[:60]
